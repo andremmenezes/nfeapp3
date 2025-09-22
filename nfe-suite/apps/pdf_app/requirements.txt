@@ -3,3 +3,4 @@ pandas
 pdf2image
 Pillow
 pyzbar
+xlsxwriter
