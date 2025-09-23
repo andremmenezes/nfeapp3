@@ -1,11 +1,11 @@
-name: deploy-combo
+name: deploy-combo-app
 
 on:
   push:
     branches: [ main ]
     paths:
-      - 'apps/combo/**'
-      - '.github/workflows/main_nfeapp.yml'   # dispare se editar o próprio workflow
+      - 'nfe-suite/apps/combo_app/**'
+      - '.github/workflows/main_nfeapp.yml'
   workflow_dispatch:
 
 jobs:
@@ -16,23 +16,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # (Opcional) Garanta Python no runner se você rodar testes/lints aqui
-      # - name: Set up Python
-      #   uses: actions/setup-python@v5
-      #   with:
-      #     python-version: '3.10'
-
-      # Empacota SOMENTE a pasta apps/combo (onde está seu app Streamlit + requirements.txt)
-      - name: Zip combo app
+      # Empacota apenas a pasta do app combinado
+      - name: Zip combo_app
         run: |
-          cd apps/combo
+          cd nfe-suite/apps/combo_app
           zip -r ../../package.zip .
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: nfeapp                          # nome do seu App Service
+          app-name: nfeapp
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: package.zip
-
-          
