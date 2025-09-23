@@ -1,0 +1,44 @@
+name: build-and-deploy-combo-container
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "nfe-suite/apps/combo_app/**"
+      - ".github/workflows/combo_container.yml"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write   # para publicar no GHCR
+
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/combo_app:latest
+      APP_PATH: nfe-suite/apps/combo_app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        run: docker build -t $IMAGE_NAME $APP_PATH
+
+      - name: Push image
+        run: docker push $IMAGE_NAME
+
+      - name: Deploy to Azure Web App (container)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: nfeapp                 # <= troque se seu App Service tiver outro nome
+          publish-profile: ${{ secrets.AZURE_PUBLISH_PROFILE }}
+          images: ${{ env.IMAGE_NAME }}
