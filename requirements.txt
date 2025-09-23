@@ -4,3 +4,5 @@ openpyxl
 pyzbar
 pillow
 pdf2image
+pdfminer.six
+pypdf
