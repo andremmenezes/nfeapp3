@@ -16,15 +16,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Empacota apenas a pasta do app combinado
-      - name: Zip combo_app
-        run: |
-          cd nfe-suite/apps/combo_app
-          zip -r ../../package.zip .
-
+      # (Sem zip) – manda a pasta do app direto
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: nfeapp
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          package: package.zip
+          package: nfe-suite/apps/combo_app
+
