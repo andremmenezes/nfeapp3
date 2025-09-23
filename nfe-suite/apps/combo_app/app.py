@@ -1,9 +1,7 @@
 # nfe-suite/apps/combo_app/app.py
-# App Streamlit com abas (XML, PDF, ZIP/Lote).
-# XML: gera o MESMO Excel do seu xml_app (colunas e formatação).
-# PDF: agora NÃO depende do apps/pdf_app/extractor.py. Usa um extractor embutido
-#      (fallback 100% Python com PyPDF) para achar chaves de 44 dígitos em texto.
-#      Se você preferir e o extractor externo existir, ele será usado automaticamente.
+# XML: gera o MESMO Excel do xml_app (colunas e formatação).
+# PDF: tenta extractor externo; se não houver, usa PDFMiner (texto) e, por fim, PyPDF.
+#      Varredura robusta por chaves 44 dígitos. Informa se o PDF parece ser imagem.
 
 import io
 import os
@@ -38,7 +36,7 @@ try:
             sys.path.insert(0, str(PDF_APP_DIR))
         from extractor import extrair_chaves_de_pdf as EXTERNAL_EXTRACTOR  # type: ignore
 except Exception:
-    EXTERNAL_EXTRACTOR = None  # segue com fallback interno
+    EXTERNAL_EXTRACTOR = None
 
 # =========================
 # Helpers gerais de arquivos
@@ -203,87 +201,159 @@ def format_excel(df: pd.DataFrame) -> BytesIO:
     return final_output
 
 # =========================
-# Extractor PDF – Fallback 100% Python (PyPDF)
+# PDF: extração de texto com PDFMiner e PyPDF + busca robusta
 # =========================
-# Requer: pypdf (adicione em requirements.txt)
+# PDFMiner (puro Python, melhor para texto)
 try:
-    from pypdf import PdfReader  # leve e puro-Python
+    from pdfminer.high_level import extract_text as pdfminer_extract_text
+    _PDFMINER_OK = True
+except Exception:
+    _PDFMINER_OK = False
+    pdfminer_extract_text = None  # type: ignore
+
+# PyPDF (puro Python, alternativa)
+try:
+    from pypdf import PdfReader
     _PYPDF_OK = True
 except Exception:
     _PYPDF_OK = False
     PdfReader = None  # type: ignore
 
-_CHAVE_44_RE = re.compile(r"(?:\D|^)(\d[\d\.\s\-]{40,60}\d)(?:\D|$)")
+# regex que aceita separadores entre dígitos
+_CHUNK_RE = re.compile(r"(\d[\d\.\-\s]{40,80}\d)")
+_ONLY_DIGITS = re.compile(r"\D")
 
 def _normalize_digits(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
+    return _ONLY_DIGITS.sub("", s or "")
 
-def extract_keys_with_pypdf(pdf_path: str) -> tuple[list[str], list[str]]:
-    """Lê texto do PDF e captura sequências numéricas; devolve (chaves_44, outras)."""
-    if not _PYPDF_OK or PdfReader is None:
-        raise RuntimeError("pypdf não disponível")
-    reader = PdfReader(pdf_path)
-    found: list[str] = []
-    others: list[str] = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        for m in _CHAVE_44_RE.finditer(text):
-            raw = m.group(1)
-            digits = _normalize_digits(raw)
+def _slide_44(line_digits: str) -> list[str]:
+    """varre a sequência de dígitos e extrai todos os blocos de 44 dígitos (sobrepostos)"""
+    out = []
+    n = len(line_digits)
+    for i in range(0, max(0, n - 43)):
+        blk = line_digits[i:i+44]
+        if len(blk) == 44 and blk.isdigit():
+            out.append(blk)
+    return out
+
+def extract_keys_with_pdfminer(path: str) -> tuple[list[str], str]:
+    if not _PDFMINER_OK or pdfminer_extract_text is None:
+        return [], ""
+    try:
+        text = pdfminer_extract_text(path) or ""
+    except Exception:
+        return [], ""
+    keys: list[str] = []
+    # por linha melhora a precisão
+    for raw_line in text.splitlines():
+        # 1) pega blocos com separadores
+        for m in _CHUNK_RE.finditer(raw_line):
+            digits = _normalize_digits(m.group(1))
             if len(digits) == 44:
-                found.append(digits)
-            elif 38 <= len(digits) <= 50:
-                # guarda leituras próximas de 44 para auditoria
-                others.append(digits)
-    # dedup preservando ordem
-    seen = set()
-    keys = [k for k in found if not (k in seen or seen.add(k))]
-    return keys, others
+                keys.append(digits)
+            elif len(digits) > 44:
+                keys.extend(_slide_44(digits))
+        # 2) varredura direta na linha (se tiver só dígitos)
+        digits_line = _normalize_digits(raw_line)
+        if len(digits_line) >= 44:
+            keys.extend(_slide_44(digits_line))
+    return keys, text
 
-def extrair_chaves_pdf_fallback(pdf_path: str) -> tuple[list[str], list[str]]:
-    """Tenta pypdf; se falhar, retorna vazio (sem travar o app)."""
-    if _PYPDF_OK:
-        try:
-            return extract_keys_with_pypdf(pdf_path)
-        except Exception:
-            pass
-    return [], []  # sem erro fatal
+def extract_keys_with_pypdf(path: str) -> tuple[list[str], str]:
+    if not _PYPDF_OK or PdfReader is None:
+        return [], ""
+    try:
+        reader = PdfReader(path)
+    except Exception:
+        return [], ""
+    keys: list[str] = []
+    txt_all = []
+    for pg in reader.pages:
+        t = pg.extract_text() or ""
+        txt_all.append(t)
+        for m in _CHUNK_RE.finditer(t):
+            digits = _normalize_digits(m.group(1))
+            if len(digits) == 44:
+                keys.append(digits)
+            elif len(digits) > 44:
+                keys.extend(_slide_44(digits))
+        digits_line = _normalize_digits(t)
+        if len(digits_line) >= 44:
+            keys.extend(_slide_44(digits_line))
+    return keys, "\n".join(txt_all)
 
-# =========================
-# Pipelines para PDF (usa externo se houver; senão fallback PyPDF)
-# =========================
 def processar_pdfs(paths: list[Path]):
     """
-    Para cada PDF:
-      - se houver extractor externo (apps/pdf_app/extractor.py), usa ele
-      - senão usa fallback PyPDF (puro Python)
-    Retorna df_resumo (por arquivo) e df_chaves (1 linha por chave, sem duplicatas)
+    Ordem:
+      1) extractor externo (se existir)
+      2) PDFMiner (texto)
+      3) PyPDF (texto)
+    Retorna df_resumo (por arquivo) e df_chaves (1 por chave)
     """
     linhas = []
     resumo = []
+
     for p in sorted(paths, key=lambda x: x.name.lower()):
         try:
-            if EXTERNAL_EXTRACTOR is not None:
-                chaves, outras = EXTERNAL_EXTRACTOR(str(p))
-            else:
-                chaves, outras = extrair_chaves_pdf_fallback(str(p))
+            chaves: list[str] = []
+            txt_used = ""
 
-            chaves = [c for c in chaves if c.isdigit()]
-            chaves = sorted(set(chaves))  # dedup
+            if EXTERNAL_EXTRACTOR is not None:
+                # seu extractor retorna (chaves, outras)
+                try:
+                    ext_keys, ext_others = EXTERNAL_EXTRACTOR(str(p))
+                    chaves.extend(ext_keys or [])
+                    txt_used = "external"
+                except Exception:
+                    pass
+
+            if not chaves:
+                # tenta PDFMiner
+                keys_miner, text_miner = extract_keys_with_pdfminer(str(p))
+                chaves.extend(keys_miner or [])
+                if keys_miner:
+                    txt_used = "pdfminer"
+                elif text_miner:
+                    txt_used = "pdfminer_no_keys"
+
+            if not chaves:
+                # tenta PyPDF
+                keys_pypdf, text_pypdf = extract_keys_with_pypdf(str(p))
+                chaves.extend(keys_pypdf or [])
+                if keys_pypdf:
+                    txt_used = "pypdf"
+                elif text_pypdf:
+                    txt_used = "pypdf_no_keys"
+
+            # dedup preservando ordem
+            seen = set()
+            chaves = [c for c in chaves if c.isdigit() and (c not in seen and not seen.add(c))]
+
             for c in chaves:
                 linhas.append({"arquivo": p.name, "chave_44": c})
-            resumo.append({
-                "arquivo": p.name,
-                "qtd_chaves_44": len(chaves),
-                "chaves_44": ", ".join(chaves) if chaves else "",
-                "outras_leituras": ", ".join(outras) if outras else ""
-            })
+
+            if chaves:
+                resumo.append({
+                    "arquivo": p.name,
+                    "qtd_chaves_44": len(chaves),
+                    "chaves_44": ", ".join(chaves),
+                    "metodo": txt_used
+                })
+            else:
+                # sem texto => provavelmente PDF escaneado (imagem)
+                resumo.append({
+                    "arquivo": p.name,
+                    "qtd_chaves_44": 0,
+                    "chaves_44": "",
+                    "metodo": "sem_texto? (provável PDF escaneado; precisa OCR/leitor de códigos)"
+                })
+
         except Exception as e:
             resumo.append({
                 "arquivo": p.name,
                 "qtd_chaves_44": 0,
                 "chaves_44": "",
-                "outras_leituras": f"ERRO: {e}"
+                "metodo": f"ERRO: {e}"
             })
 
     df_chaves = pd.DataFrame(linhas).drop_duplicates().reset_index(drop=True)
@@ -347,7 +417,7 @@ with tab_pdf:
         "Selecione um ou mais PDFs",
         type=["pdf"],
         accept_multiple_files=True,
-        help="O app lê todas as páginas; acha todas as chaves de 44 dígitos em texto (fallback PyPDF)."
+        help="O app tenta extractor externo, depois PDFMiner e PyPDF. Se o PDF for escaneado (imagem), será necessário OCR/leitor de código."
     )
 
     if st.button("Processar PDFs", disabled=not pdf_files):
