@@ -4,6 +4,7 @@ openpyxl
 Pillow
 pdf2image
 pyzbar
+pypdf2
 
 
 
