@@ -1,4 +1,9 @@
 streamlit
 pandas
 openpyxl
+Pillow
+pdf2image
+pyzbar
+
+
 
