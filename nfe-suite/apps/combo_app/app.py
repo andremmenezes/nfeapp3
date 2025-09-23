@@ -1,12 +1,14 @@
 # nfe-suite/apps/combo_app/app.py
 # App Streamlit com abas (XML, PDF, ZIP/Lote).
-# Aba XML: gera o MESMO Excel do xml_app (colunas e formatação).
-# Aba PDF: extrai chaves de NF-e dos PDFs usando o extractor do pdf_app e
-#         disponibiliza Excel/CSV como no app dedicado — mas sem bug de to_excel (usa BytesIO).
+# XML: gera o MESMO Excel do seu xml_app (colunas e formatação).
+# PDF: agora NÃO depende do apps/pdf_app/extractor.py. Usa um extractor embutido
+#      (fallback 100% Python com PyPDF) para achar chaves de 44 dígitos em texto.
+#      Se você preferir e o extractor externo existir, ele será usado automaticamente.
 
 import io
 import os
 import sys
+import re
 import zipfile
 import tempfile
 from pathlib import Path
@@ -25,31 +27,23 @@ st.set_page_config(page_title="NFe Suite", layout="wide")
 st.title("NFe Suite – Upload e Processamento")
 
 # =========================
-# Imports do extractor (pdf_app)
+# Tentativa de usar extractor externo (opcional)
 # =========================
-# Estrutura esperada do repo:
-# nfe-suite/
-#   apps/
-#     combo_app/   (ESTE arquivo)
-#     pdf_app/
-#       extractor.py  (contém extrair_chaves_de_pdf)
-HERE = Path(__file__).resolve()
-PDF_APP_DIR = (HERE.parent.parent / "pdf_app").resolve()  # .../apps/pdf_app
-if str(PDF_APP_DIR) not in sys.path:
-    sys.path.insert(0, str(PDF_APP_DIR))
-
+EXTERNAL_EXTRACTOR = None
 try:
-    # noqa: E402
-    from extractor import extrair_chaves_de_pdf  # type: ignore
-except Exception as e:
-    extrair_chaves_de_pdf = None  # será verificado ao usar a aba PDF
-    _extractor_import_error = e
+    HERE = Path(__file__).resolve()
+    PDF_APP_DIR = (HERE.parent.parent / "pdf_app").resolve()  # .../apps/pdf_app
+    if PDF_APP_DIR.exists():
+        if str(PDF_APP_DIR) not in sys.path:
+            sys.path.insert(0, str(PDF_APP_DIR))
+        from extractor import extrair_chaves_de_pdf as EXTERNAL_EXTRACTOR  # type: ignore
+except Exception:
+    EXTERNAL_EXTRACTOR = None  # segue com fallback interno
 
 # =========================
 # Helpers gerais de arquivos
 # =========================
 def save_uploaded_files(files, dest_dir: Path) -> list[Path]:
-    """Grava arquivos enviados para uma pasta e retorna a lista de Paths."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     for f in files:
@@ -60,14 +54,13 @@ def save_uploaded_files(files, dest_dir: Path) -> list[Path]:
     return saved
 
 def extract_zip_to(zip_bytes: bytes, dest_dir: Path) -> list[Path]:
-    """Extrai um ZIP (em bytes) para dest_dir e retorna os Paths extraídos (arquivos, sem diretórios)."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for member in zf.infolist():
             if member.is_dir():
                 continue
-            target = dest_dir / Path(member.filename).name  # normaliza nome
+            target = dest_dir / Path(member.filename).name
             with zf.open(member, "r") as src, open(target, "wb") as dst:
                 dst.write(src.read())
             saved.append(target)
@@ -77,16 +70,11 @@ def extract_zip_to(zip_bytes: bytes, dest_dir: Path) -> list[Path]:
 # Helpers de Excel (XML/PDF)
 # =========================
 def df_to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
-    """
-    Recebe {'NomeDaAba': DataFrame} e devolve bytes de um .xlsx sem gravar em disco.
-    """
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for name, df in sheets.items():
-            safe_name = (name or "Planilha")[:31]
-            (df if not df.empty else pd.DataFrame()).to_excel(
-                writer, index=False, sheet_name=safe_name
-            )
+            safe = (name or "Planilha")[:31]
+            (df if not df.empty else pd.DataFrame()).to_excel(writer, index=False, sheet_name=safe)
     buf.seek(0)
     return buf.getvalue()
 
@@ -94,7 +82,7 @@ def excel_filename(prefix: str = "resultado") -> str:
     return f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
 
 # =========================
-# === Funções do xml_app (mantém o MESMO Excel do seu app) ===
+# === Funções do xml_app (mantém MESMO Excel) ===
 # =========================
 def get_text_or_zero(elem):
     return elem.text if elem is not None and elem.text else "0"
@@ -164,7 +152,7 @@ def format_excel(df: pd.DataFrame) -> BytesIO:
     wb = load_workbook(output)
     ws = wb.active
 
-    formatos_colunas = {
+    formatos = {
         "Valor do Frete": "R$ #,##0.00",
         "Valor Total da Nota": "R$ #,##0.00",
         "Valor Total dos Produtos": "R$ #,##0.00",
@@ -180,34 +168,29 @@ def format_excel(df: pd.DataFrame) -> BytesIO:
         "ICMS(%)": "0.00%",
         "IPI(%)": "0.00%",
         "Quantidade": "0.00",
-        "NFe": "@",
-        "Série": "@",
-        "Chave": "@",
-        "CNPJ do Emitente": "@",
-        "Cód. Produto": "@",
+        "NFe": "@", "Série": "@", "Chave": "@", "CNPJ do Emitente": "@", "Cód. Produto": "@",
     }
 
-    cabecalho = {cell.value.strip(): idx + 1 for idx, cell in enumerate(ws[1]) if cell.value}
-
-    for nome_coluna, formato in formatos_colunas.items():
-        if nome_coluna in cabecalho:
-            col_idx = cabecalho[nome_coluna]
-            for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+    cab = {cell.value.strip(): i + 1 for i, cell in enumerate(ws[1]) if cell.value}
+    for nome, fmt in formatos.items():
+        if nome in cab:
+            col = cab[nome]
+            for row in ws.iter_rows(min_row=2, min_col=col, max_col=col):
                 cell = row[0]
                 try:
-                    valor = str(cell.value or "").replace("R$", "").replace("%", "").replace(",", ".").strip()
-                    if valor == "":
+                    val = str(cell.value or "").replace("R$", "").replace("%", "").replace(",", ".").strip()
+                    if val == "":
                         continue
-                    if formato == "0":
-                        cell.value = int(float(valor))
-                    elif formato.endswith("%"):
-                        cell.value = float(valor) / 100
-                    elif formato == "@":
+                    if fmt == "0":
+                        cell.value = int(float(val))
+                    elif fmt.endswith("%"):
+                        cell.value = float(val) / 100
+                    elif fmt == "@":
                         cell.value = str(cell.value).strip()
                     else:
-                        cell.value = float(valor)
-                    cell.number_format = formato
-                    if nome_coluna == "CNPJ do Emitente":
+                        cell.value = float(val)
+                    cell.number_format = fmt
+                    if nome == "CNPJ do Emitente":
                         cnpj = "".join(filter(str.isdigit, str(cell.value)))
                         if len(cnpj) == 14:
                             cell.value = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
@@ -220,27 +203,73 @@ def format_excel(df: pd.DataFrame) -> BytesIO:
     return final_output
 
 # =========================
-# Pipelines para PDF (usa extractor do pdf_app)
+# Extractor PDF – Fallback 100% Python (PyPDF)
 # =========================
-def processar_pdfs(paths: list[Path], dpi: int = 300, poppler_path: str | None = None):
-    """
-    Para cada PDF, extrai chaves com o extractor do pdf_app.
-    Retorna:
-      df_resumo: por arquivo (qtd_chaves_44, lista, outras leituras)
-      df_chaves: uma linha por chave (deduplicado)
-    """
-    if extrair_chaves_de_pdf is None:
-        raise RuntimeError(
-            f"Extractor não disponível. Erro de import: {_extractor_import_error!r}\n"
-            "Verifique se nfe-suite/apps/pdf_app/extractor.py existe e dependências (pdf2image, pillow, pyzbar/poppler) estão instaladas."
-        )
+# Requer: pypdf (adicione em requirements.txt)
+try:
+    from pypdf import PdfReader  # leve e puro-Python
+    _PYPDF_OK = True
+except Exception:
+    _PYPDF_OK = False
+    PdfReader = None  # type: ignore
 
+_CHAVE_44_RE = re.compile(r"(?:\D|^)(\d[\d\.\s\-]{40,60}\d)(?:\D|$)")
+
+def _normalize_digits(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+def extract_keys_with_pypdf(pdf_path: str) -> tuple[list[str], list[str]]:
+    """Lê texto do PDF e captura sequências numéricas; devolve (chaves_44, outras)."""
+    if not _PYPDF_OK or PdfReader is None:
+        raise RuntimeError("pypdf não disponível")
+    reader = PdfReader(pdf_path)
+    found: list[str] = []
+    others: list[str] = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        for m in _CHAVE_44_RE.finditer(text):
+            raw = m.group(1)
+            digits = _normalize_digits(raw)
+            if len(digits) == 44:
+                found.append(digits)
+            elif 38 <= len(digits) <= 50:
+                # guarda leituras próximas de 44 para auditoria
+                others.append(digits)
+    # dedup preservando ordem
+    seen = set()
+    keys = [k for k in found if not (k in seen or seen.add(k))]
+    return keys, others
+
+def extrair_chaves_pdf_fallback(pdf_path: str) -> tuple[list[str], list[str]]:
+    """Tenta pypdf; se falhar, retorna vazio (sem travar o app)."""
+    if _PYPDF_OK:
+        try:
+            return extract_keys_with_pypdf(pdf_path)
+        except Exception:
+            pass
+    return [], []  # sem erro fatal
+
+# =========================
+# Pipelines para PDF (usa externo se houver; senão fallback PyPDF)
+# =========================
+def processar_pdfs(paths: list[Path]):
+    """
+    Para cada PDF:
+      - se houver extractor externo (apps/pdf_app/extractor.py), usa ele
+      - senão usa fallback PyPDF (puro Python)
+    Retorna df_resumo (por arquivo) e df_chaves (1 linha por chave, sem duplicatas)
+    """
     linhas = []
     resumo = []
     for p in sorted(paths, key=lambda x: x.name.lower()):
         try:
-            chaves, outras = extrair_chaves_de_pdf(str(p), dpi=dpi, poppler_path=poppler_path)
-            chaves = sorted(set(chaves))  # dedup e ordena
+            if EXTERNAL_EXTRACTOR is not None:
+                chaves, outras = EXTERNAL_EXTRACTOR(str(p))
+            else:
+                chaves, outras = extrair_chaves_pdf_fallback(str(p))
+
+            chaves = [c for c in chaves if c.isdigit()]
+            chaves = sorted(set(chaves))  # dedup
             for c in chaves:
                 linhas.append({"arquivo": p.name, "chave_44": c})
             resumo.append({
@@ -261,10 +290,6 @@ def processar_pdfs(paths: list[Path], dpi: int = 300, poppler_path: str | None =
     df_resumo = pd.DataFrame(resumo).sort_values("arquivo").reset_index(drop=True)
     return df_resumo, df_chaves
 
-def excel_resumo_chaves(df_resumo: pd.DataFrame, df_chaves: pd.DataFrame) -> bytes:
-    """Gera um .xlsx com 2 abas: Resumo_PDF e Chaves_PDF (em memória)."""
-    return df_to_excel_bytes({"Resumo_PDF": df_resumo, "Chaves_PDF": df_chaves})
-
 # =========================
 # Pasta temporária por sessão
 # =========================
@@ -276,7 +301,7 @@ session_tmp.mkdir(parents=True, exist_ok=True)
 # =========================
 tab_xml, tab_pdf, tab_zip = st.tabs(["XML (múltiplos)", "PDF (múltiplos)", "ZIP/Lote"])
 
-# --------- Aba: XML (usa MESMO Excel do xml_app) ----------
+# --------- Aba: XML ----------
 with tab_xml:
     st.subheader("Enviar XMLs")
     xml_files = st.file_uploader(
@@ -304,8 +329,8 @@ with tab_xml:
             extract_info_from_xml(p, notas)
         df_xml = pd.DataFrame(columns=colunas, data=notas)
 
-        excel_bytes = format_excel(df_xml)  # BytesIO
-        st.success("✅ Processamento concluído!")
+        excel_bytes = format_excel(df_xml)
+        st.success("✅ XMLs processados!")
         st.download_button(
             label="📥 Baixar Excel (XMLs)",
             data=excel_bytes.getvalue(),
@@ -315,64 +340,50 @@ with tab_xml:
         )
         st.dataframe(df_xml.head(50), use_container_width=True)
 
-# --------- Aba: PDF (usa extractor do pdf_app) ----------
+# --------- Aba: PDF ----------
 with tab_pdf:
     st.subheader("Enviar PDFs")
-    with st.expander("Configurações (opcional)"):
-        dpi = st.number_input("DPI para conversão (pdf2image)", min_value=100, max_value=600, value=300, step=50)
-        poppler_path = st.text_input("poppler_path (somente Windows/local se precisar)", value="")
-        poppler_path = poppler_path or None
-
     pdf_files = st.file_uploader(
         "Selecione um ou mais PDFs",
         type=["pdf"],
         accept_multiple_files=True,
-        help="O app lê TODAS as páginas e encontra TODAS as chaves de 44 dígitos (remove duplicatas)."
+        help="O app lê todas as páginas; acha todas as chaves de 44 dígitos em texto (fallback PyPDF)."
     )
 
     if st.button("Processar PDFs", disabled=not pdf_files):
-        if extrair_chaves_de_pdf is None:
-            st.error("Extractor não encontrado. Verifique dependências e o arquivo apps/pdf_app/extractor.py.")
-        else:
-            dest = session_tmp / "pdf_uploads"
-            paths = save_uploaded_files(pdf_files, dest)
-            st.success(f"{len(paths)} PDF(s) recebidos.")
+        dest = session_tmp / "pdf_uploads"
+        paths = save_uploaded_files(pdf_files, dest)
+        st.success(f"{len(paths)} PDF(s) recebidos.")
 
-            df_resumo, df_chaves = processar_pdfs(paths, dpi=int(dpi), poppler_path=poppler_path)
+        df_resumo, df_chaves = processar_pdfs(paths)
 
-            st.subheader("Resumo por arquivo")
-            st.dataframe(df_resumo, use_container_width=True)
+        st.subheader("Resumo por arquivo")
+        st.dataframe(df_resumo, use_container_width=True)
 
-            st.subheader("Linhas por chave (deduplicadas)")
-            st.dataframe(df_chaves, use_container_width=True)
+        st.subheader("Linhas por chave (deduplicadas)")
+        st.dataframe(df_chaves, use_container_width=True)
 
-            # Excel com duas abas (Resumo_PDF e Chaves_PDF)
-            xlsx_bytes = excel_resumo_chaves(df_resumo, df_chaves)
-            st.download_button(
-                "📥 Baixar Excel (PDFs)",
-                data=xlsx_bytes,
-                file_name=excel_filename("pdfs"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+        xlsx_bytes = df_to_excel_bytes({"Resumo_PDF": df_resumo, "Chaves_PDF": df_chaves})
+        st.download_button(
+            "📥 Baixar Excel (PDFs)",
+            data=xlsx_bytes,
+            file_name=excel_filename("pdfs"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+        st.download_button(
+            "Baixar chaves (CSV)",
+            data=df_chaves.to_csv(index=False).encode("utf-8"),
+            file_name="chaves_por_linha.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
-            # CSV opcional das chaves
-            st.download_button(
-                "Baixar chaves (CSV)",
-                data=df_chaves.to_csv(index=False).encode("utf-8"),
-                file_name="chaves_por_linha.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-
-# --------- Aba: ZIP/Lote (processa XMLs e PDFs juntos) ----------
+# --------- Aba: ZIP/Lote ----------
 with tab_zip:
     st.subheader("Enviar ZIP com lote (XMLs e/ou PDFs)")
-    with st.expander("Configurações de PDF (opcional)"):
-        dpi_zip = st.number_input("DPI (ZIP)", min_value=100, max_value=600, value=300, step=50, key="dpi_zip")
-        poppler_path_zip = st.text_input("poppler_path (ZIP)", value="", key="poppler_zip") or None
-
     zip_file = st.file_uploader("Selecione um .zip", type=["zip"])
+
     if st.button("Processar ZIP", disabled=not zip_file):
         dest = session_tmp / "zip_extract"
         paths = extract_zip_to(zip_file.getvalue(), dest)
@@ -383,7 +394,6 @@ with tab_zip:
 
         sheets: dict[str, pd.DataFrame] = {}
 
-        # XMLs do lote -> MESMO Excel do xml_app
         if xmls:
             colunas = [
                 "NFe", "Série", "Natureza da Operação", "Data de emissão", "Data de Saída/Entrada",
@@ -401,16 +411,12 @@ with tab_zip:
             st.write("Prévia XMLs do ZIP")
             st.dataframe(df_xml_zip.head(50), use_container_width=True)
 
-        # PDFs do lote
         if pdfs:
-            if extrair_chaves_de_pdf is None:
-                st.warning("Extractor não disponível — PDFs do ZIP não serão processados.")
-            else:
-                df_resumo_zip, df_chaves_zip = processar_pdfs(pdfs, dpi=int(dpi_zip), poppler_path=poppler_path_zip)
-                sheets["Resumo_PDF"] = df_resumo_zip
-                sheets["Chaves_PDF"] = df_chaves_zip
-                st.write("Prévia PDFs do ZIP")
-                st.dataframe(df_resumo_zip.head(50), use_container_width=True)
+            df_resumo_zip, df_chaves_zip = processar_pdfs(pdfs)
+            sheets["Resumo_PDF"] = df_resumo_zip
+            sheets["Chaves_PDF"] = df_chaves_zip
+            st.write("Prévia PDFs do ZIP")
+            st.dataframe(df_resumo_zip.head(50), use_container_width=True)
 
         if sheets:
             xlsx_bytes = df_to_excel_bytes(sheets)
